@@ -1,10 +1,12 @@
 import gym
 import collections
 import numpy as np
+import random
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 
 '''
 Typically, people implement replay buffers with one of the following three data structures:
@@ -25,12 +27,24 @@ class ExperienceBuffer:
     def push(self, experience):
         self.buffer.append(experience)
 
-    def sample(self, batch_size):
+    def sample_v1(self, batch_size):
         indexs = np.random.choice(len(self.buffer), batch_size, replace=False)
         # 序列解包 https://www.jianshu.com/p/f9e7140ce19d
         states, actions, rewards, dones, next_states = zip(*[self.buffer[i] for i in indexs])
+        # print("states:", states, len(states))
+        states = torch.cat(states)  # 在第0维拼接，这样第0维表示batch_size
+        # print("torch.cat(states):", states, len(states))
+        # print("np.array(states):", np.array(states))
+        # print("actions:", actions, len(actions))
+        # print("np.array(actions):", np.array(actions).reshape((-1,1)))
+        next_states = torch.cat(next_states)    # 不能提前在这里拼接，因为有终止状态（None）的存在
+        # print("next_states:", next_states)
         # 返回numpy数组为了后续计算方便
-        return np.array(states), np.array(actions), np.array(rewards, dtype=np.float32), np.array(dones, dtype=np.uint8), np.array(next_states)
+        return np.array(states), np.array(actions), np.array(rewards, dtype=np.float32), np.array(dones, dtype=np.bool), np.array(next_states)
+        # return np.array(states), np.array(actions), np.array(rewards, dtype=np.float32), np.array(dones, dtype=np.bool), next_states
+
+    def sample_v2(self, batch_size):
+        return random.sample(self.buffer, batch_size)
 
     def __len__(self):  # 在我们自定义的类中，要让len()函数工作正常，类必须提供一个特殊方法__len__()，这样就可以len(buffer)得到缓冲区当前长度了
         return len(self.buffer)
@@ -75,11 +89,11 @@ class Agent:
     def __init__(self, env):
         self.env = env
         self.gamma = 0.99           # 折扣因子
-        self.epsilon = 1            # 初始epsilon值
+        self.epsilon = 1.0          # 初始epsilon值
         self.epsilon_decay = .995   # 每次随机衰减0.005
         self.epsilon_min = 0.02     # epsilon衰减最小值后不再衰减
         self.lr = 1e-4              # 学习率
-        self.target_net_update_frequency = 10000    # target network的更新频率
+        self.target_net_update_frequency = 1000     # target network的更新频率
         self.batch_size = 32
         self.buffer_capacity = 10000
         self.buffer = ExperienceBuffer(capacity=self.buffer_capacity)
@@ -91,20 +105,50 @@ class Agent:
     def choose_action(self, state):
         global steps_done
         eps = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-        steps_done += 1
+        steps_done += 1     # 用于记录执行步数
         if np.random.random() < eps:    # random
             # return self.env.action_space.sample()   # 如：2
-            return torch.tensor(np.random.randint(self.env.action_space.n))  # 如：tensor(2)
+            # return torch.tensor(np.random.randint(self.env.action_space.n))  # 如：tensor(2)
+            return torch.tensor([np.random.randint(self.env.action_space.n)])   # 如： tensor([2])
         else:
             q_values = self.policy_net(state)
             return q_values.max(1)[1]               # 如：tensor([2])  格式不统一？有的代码后面为什么加.view(1,1)？
 
-    def optimize_model(self):
+    def optimize_model(self, device="cpu"):
         if len(self.buffer) < self.batch_size:
             return
-        states, actions, rewards, dones, next_states = self.buffer.sample(self.batch_size)
-        # print("states:", states)
 
+        states, actions, rewards, dones, next_states = self.buffer.sample_v1(self.batch_size)
+
+        states_batch = torch.tensor(states).to(device)
+        # print("states_batch", states_batch)
+        actions_batch = torch.tensor(actions).to(device)
+        rewards_batch = torch.tensor(rewards).to(device)
+        # print("rewards_batch:", rewards_batch)
+        next_states_batch = torch.tensor(next_states).to(device)
+        dones_mask = torch.tensor(dones).to(device)
+        # print("dones_mask:", dones_mask)
+
+        current_q_value = self.policy_net(states_batch.float())
+        # print(current_q_value, current_q_value.size())
+        # .gather()方法：https://blog.csdn.net/qq_34392457/article/details/90206220
+        # 要将actions_batch每一个元素加上[]才能在gather处作为index
+        current_q_value = current_q_value.gather(1, actions_batch.reshape((-1, 1))).squeeze()   # 降维，将维度为1的维数压缩
+        # print("current_q_value:", current_q_value, current_q_value.size())
+
+        # next_q_value = torch.zeros(self.batch_size, device=device)
+        next_q_value = self.target_net(next_states_batch.float()).max(1)[0].detach()    # 切断目标网络的反向传播
+        next_q_value[dones_mask] = 0.0  # 终止状态值置0
+        # print("next_q_value:", next_q_value)
+        target_value = rewards_batch + self.gamma * next_q_value
+        # print("target_value:", target_value)
+        # calculate dqn loss
+        loss = F.smooth_l1_loss(current_q_value, target_value)
+        self.optimizer.zero_grad()
+        loss.backward()
+        for param in self.policy_net.parameters():
+            param.grad.data.clamp_(-1, 1)  # 梯度截断，将所有梯度限制在-1至1之间
+        self.optimizer.step()
         return
 
     def get_state(self, obs):
@@ -114,36 +158,53 @@ class Agent:
         state = torch.from_numpy(state)     # numpy转为Tensor
         # print(state.unsqueeze(0).shape)
         return state.unsqueeze(0)   # 第0维增加一个维度作为batch_size->(1, 3, 210, 160)
+        # return state
 
     def train(self, episodes_num, max_steps, render=False):
         for i in range(episodes_num):
             obs = self.env.reset()
             state = self.get_state(obs)
             score = 0.0
-            for t in range(max_steps):  # max_steps应能保证到达done或接近，太小（500）则始终无法done
-                # print("state:", state)
+            for t in range(max_steps):  # max_steps应能保证到达done或接近，太小（500）则始终无法done（是游戏的终止，不是一条命的终止），对于这个游戏设置为5000比较合适（或者不设置最大步数直到结束）
                 action = self.choose_action(state)
-                # print("action:", action)
                 if render:
                     self.env.render()
-                observation, reward, done, info = self.env.step(action)
+                observation, reward, done, info = self.env.step(action.item())  # item()方法将一个标量Tensor转化为一个python number
+                # if not (reward == 0.0):
+                #     print(f"reward:{reward}, episodes:{i}, steps:{t}")
                 score += reward
                 if not done:
                     next_state = self.get_state(observation)
                 else:
-                    next_state = None
+                    # next_state = None
+                    next_state = torch.zeros_like(state)    # 必须保持维度一致，才可以进行后续的cat操作
                 # store the experience
-                experience = Transition(state, action, reward, done, next_state)
+                reward = torch.tensor([reward], device='cpu')
+                done = torch.tensor([done], device='cpu')
+                # print("state:", state)
+                # action = action.unsqueeze(0)    # tensor([1]) -> tensor([[1]])
+                # print("action:", action)
+                # print("reward:", reward)
+                # print("done:", done)
+                # print("next_state:", next_state)
+                experience = Transition(state, action.to('cpu'), reward.to('cpu'), done.to('cpu'), next_state)
                 self.buffer.push(experience)
                 state = next_state
-                # if steps_done > 100:
-                #     self.optimize_model()
+                if steps_done > 1000:  # 当执行步数存储的经验足够多时才开始优化模型 9999
+                    self.optimize_model(device="cpu")
+                    if steps_done % self.target_net_update_frequency == 0:
+                        self.target_net.load_state_dict(self.policy_net.state_dict())
+                if steps_done % 100 == 0:
+                    print("episode:", i, " steps:", t)     # 开始优化模型后每一个step都很慢，除了使用GPU外如何解决？
                 if done:
                     print(f'Episode {i} is done.')
                     break
-            if i % 20 == 0:     # 每20个episodes打印一次当前episode的得分
-                print(f'Score is {score} during Episode {i}. ')
+            # if i % 20 == 0:     # 每20个episodes打印一次当前episode的得分
+            print(f'Score is {score} during Episode {i}. ')
 
+        return
+
+    def test(self):
         return
 
     def plot(self):
@@ -182,9 +243,13 @@ if __name__ == "__main__":
     '''
     # buffer = ExperienceBuffer(5)
     # exp1 = Transition(1, 2, 3, 4, 5)
+    # exp2 = Transition(6, 7, 8, 9, 10)
     # buffer.push(exp1)
-    # exp2 = buffer.sample(1)
-    # print("exp2:",exp2)
+    # buffer.push(exp2)
+    # batch1 = buffer.sample_v1(2)
+    # batch2 = buffer.sample_v2(2)
+    # print("batch1:", batch1)
+    # print("batch2:", batch2)
     # print(len(buffer))
 
     '''
@@ -222,6 +287,6 @@ if __name__ == "__main__":
     # env = env.unwrapped  # 还原env的原始设置，env外包了一层防作弊层
     steps_done = 0
     agent = Agent(env)
-    agent.train(21, 5000)
+    agent.train(50, 5000)
 
 
