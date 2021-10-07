@@ -2,6 +2,8 @@ import gym
 import collections
 import numpy as np
 import random
+from itertools import count
+import time
 
 import torch
 import torch.nn as nn
@@ -86,7 +88,7 @@ class DQN(nn.Module):
 
 
 class Agent:
-    def __init__(self, env):
+    def __init__(self, env, device):
         self.env = env
         self.gamma = 0.99           # 折扣因子
         self.epsilon = 1.0          # 初始epsilon值
@@ -144,11 +146,11 @@ class Agent:
         # print("target_value:", target_value)
         # calculate dqn loss
         loss = F.smooth_l1_loss(current_q_value, target_value)
-        self.optimizer.zero_grad()
-        loss.backward()
+        self.optimizer.zero_grad()  # # 每次运算都要将上一次所有参数的梯度清空
+        loss.backward()     # 反向传播
         for param in self.policy_net.parameters():
             param.grad.data.clamp_(-1, 1)  # 梯度截断，将所有梯度限制在-1至1之间
-        self.optimizer.step()
+        self.optimizer.step()   # 更新模型参数
         return
 
     def get_state(self, obs):
@@ -160,12 +162,14 @@ class Agent:
         return state.unsqueeze(0)   # 第0维增加一个维度作为batch_size->(1, 3, 210, 160)
         # return state
 
-    def train(self, episodes_num, max_steps, render=False):
+    def train(self, episodes_num, render=False):
         for i in range(episodes_num):
             obs = self.env.reset()
             state = self.get_state(obs)
             score = 0.0
-            for t in range(max_steps):  # max_steps应能保证到达done或接近，太小（500）则始终无法done（是游戏的终止，不是一条命的终止），对于这个游戏设置为5000比较合适（或者不设置最大步数直到结束）
+            # max_steps应能保证到达done或接近，太小（500）则始终无法done（是游戏的终止，不是一条命的终止），对于这个游戏设置为5000比较合适（或者不设置最大步数直到结束）
+            # for t in range(max_steps):
+            for t in count():
                 action = self.choose_action(state)
                 if render:
                     self.env.render()
@@ -179,8 +183,8 @@ class Agent:
                     # next_state = None
                     next_state = torch.zeros_like(state)    # 必须保持维度一致，才可以进行后续的cat操作
                 # store the experience
-                reward = torch.tensor([reward], device='cpu')
-                done = torch.tensor([done], device='cpu')
+                reward = torch.tensor([reward], device=device)
+                done = torch.tensor([done], device=device)
                 # print("state:", state)
                 # action = action.unsqueeze(0)    # tensor([1]) -> tensor([[1]])
                 # print("action:", action)
@@ -191,20 +195,43 @@ class Agent:
                 self.buffer.push(experience)
                 state = next_state
                 if steps_done > 1000:  # 当执行步数存储的经验足够多时才开始优化模型 9999
-                    self.optimize_model(device="cpu")
+                    self.optimize_model(device=device)
                     if steps_done % self.target_net_update_frequency == 0:
                         self.target_net.load_state_dict(self.policy_net.state_dict())
-                if steps_done % 100 == 0:
+                if t % 200 == 0:
                     print("episode:", i, " steps:", t)     # 开始优化模型后每一个step都很慢，除了使用GPU外如何解决？
                 if done:
                     print(f'Episode {i} is done.')
                     break
             # if i % 20 == 0:     # 每20个episodes打印一次当前episode的得分
             print(f'Score is {score} during Episode {i}. ')
-
         return
 
-    def test(self):
+    def test(self, episodes_num, policy, render=False):
+        for i in range(episodes_num):
+            obs = self.env.reset()
+            state = self.get_state(obs)
+            score = 0.0
+            for t in count():   # count()生成无限递归序列
+                action = policy(state).max(1)[1]
+                if render:
+                    self.env.render()
+                    time.sleep(0.02)
+                observation, reward, done, info = self.env.step(action.item())  # item()方法将一个标量Tensor转化为一个python number
+
+                score += reward
+                if not done:
+                    next_state = self.get_state(observation)
+                else:
+                    next_state = None
+                state = next_state
+                if t % 200 == 0:
+                    print("episode:", i, " steps:", t)
+                if done:
+                    print(f'Episode {i} is done.')
+                    break
+            # if i % 20 == 0:     # 每20个episodes打印一次当前episode的得分
+            print(f'Score is {score} during Episode {i}. ')
         return
 
     def plot(self):
@@ -280,13 +307,18 @@ if __name__ == "__main__":
     # print(torch.tensor(np.random.randint(6)))
 
     '''
-        Test self.train()
+        Test self.train() and self.test()
     '''
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     env = gym.make('PongNoFrameskip-v4')
     # env.seed(1)  # 可选，设置随机数，以便让过程重现
-    # env = env.unwrapped  # 还原env的原始设置，env外包了一层防作弊层
+    # env = env.unwrapped  # 还原env的原始设置，env外包了一层防作弊层 可以得到原始的类,原始类想step多久就多久,不会200步后失败
     steps_done = 0
-    agent = Agent(env)
-    agent.train(50, 5000)
+    agent = Agent(env, device=device)
+    agent.train(100)
+    print("Training ends.")
+    torch.save(agent.policy_net, "dqn_pong_model")
+    policy_net = torch.load("dqn_pong_model")
+    agent.test(5, policy_net)
 
 
