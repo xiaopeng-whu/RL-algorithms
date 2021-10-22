@@ -73,11 +73,11 @@ class PPO(nn.Module):
             delta = td_target - self.v(s)
             delta = delta.detach().numpy()
             # print("delta:", delta)
-            # compute advantage:GAE
+            # compute advantage:GAE https://zhuanlan.zhihu.com/p/139097326
             advantage_lst = []
             advantage = 0.0
             for delta_t in delta[::-1]:
-                advantage = gamma * lmbda * advantage + delta_t[0]  # TD(λ)
+                advantage = gamma * lmbda * advantage + delta_t[0]  # GAE(γ,λ)
                 advantage_lst.append([advantage])
             advantage_lst.reverse()
             advantage = torch.tensor(advantage_lst, dtype=torch.float)
