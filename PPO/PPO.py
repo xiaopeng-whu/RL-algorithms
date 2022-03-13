@@ -1,25 +1,58 @@
-'''
-    TRPO computes the gradients with a complex second-order method. 网上资源很少，应该是PPO在各方面都优于TRPO就没有必要复现流程复杂的TRPO了。
-    目前，PPO是强化学习领域最流行、热门的算法之一。
-        在工程问题中，人们一般的直觉是——比较小的问题使用DQN作为Baseline（收敛较快、便于训练），而比较大、比较复杂的问题使用PPO作为Baseline（效果较好）。
-    PPO: Proximal Policy Optimization Algorithms
-        PPO算法主要有两个变种，一个是结合KL penalty的PPO-penalty，一个是用了clip方法的PPO-clip，这里实现的是后者。
-    参考：https://github.com/seungeunrho/minimalRL/blob/master/ppo.py
-'''
-import gym
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.functional as F
+
+
+class PPOModel(nn.Module):
+    def __init__(self):
+        super(PPOModel, self).__init__()
+        self.fc1 = nn.Linear(3, 128)
+        self.fc_mu = nn.Linear(128, 1)
+        self.fc_std = nn.Linear(128, 1)
+
+        # self.fc1 = nn.Linear(60, 128)
+        # self.fc_mu = nn.Linear(128, 2)
+        # self.fc_std = nn.Linear(128, 2)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        mu = 2.0 * torch.tanh(self.fc_mu(x))
+        # mu = torch.tanh(self.fc_mu(x))
+        std = F.softplus(self.fc_std(x))
+        return mu, std
+
+
+class PPOModel2(nn.Module):
+    def __init__(self):
+        super(PPOModel2, self).__init__()
+        self.fc1 = nn.Linear(3, 128)
+        self.fc_v = nn.Linear(128, 1)
+
+        # self.fc1 = nn.Linear(60, 128)
+        # self.fc_v = nn.Linear(128, 2)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        v = self.fc_v(x)
+        return v
+
+import pdb
+import gym
+
+import torch
 import torch.optim as optim
-from torch.distributions import Categorical
+from torch.distributions import Normal
+
 
 # Hyperparameters
-learning_rate = 0.0005
-gamma         = 0.98
-lmbda         = 0.95
-eps_clip      = 0.1
-K_epoch       = 3
-T_horizon     = 20
+learning_rate = 0.0003
+gamma = 0.9
+lmbda = 0.9
+eps_clip = 0.2
+K_epoch = 10
+rollout_len = 3
+buffer_size = 30
+minibatch_size = 32
 
 
 class PPO(nn.Module):
@@ -27,106 +60,184 @@ class PPO(nn.Module):
         super(PPO, self).__init__()
         self.data = []
 
-        self.fc1   = nn.Linear(4,256)
-        self.fc_pi = nn.Linear(256,2)
-        self.fc_v  = nn.Linear(256,1)
-        self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        self.pi_model = PPOModel()
+        self.v_model = PPOModel2()
+        # self.fc1 = nn.Linear(3, 128)
+        # self.fc_mu = nn.Linear(128, 1)
+        # self.fc_std = nn.Linear(128, 1)
+        # self.fc_v = nn.Linear(128, 1)
+        # self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        self.pi_optimizer = optim.Adam(self.pi_model.parameters(), lr=learning_rate)
+        self.v_optimizer = optim.Adam(self.v_model.parameters(), lr=learning_rate)
+        self.optimization_step = 0
 
-    def pi(self, x, softmax_dim = 0):
-        x = F.relu(self.fc1(x))
-        x = self.fc_pi(x)
-        prob = F.softmax(x, dim=softmax_dim)
-        return prob
-
-    def v(self, x):
-        x = F.relu(self.fc1(x))
-        v = self.fc_v(x)
-        return v
 
     def put_data(self, transition):
+        # print("transition:", transition)  # 一次三个
         self.data.append(transition)
+        #pdb.set_trace()
 
     def make_batch(self):
-        s_lst, a_lst, r_lst, s_prime_lst, prob_a_lst, done_lst = [], [], [], [], [], []
-        for transition in self.data:
-            s, a, r, s_prime, prob_a, done = transition
+        s_batch, a_batch, r_batch, s_prime_batch, prob_a_batch, done_batch = [], [], [], [], [], []
+        data = []
 
-            s_lst.append(s)
-            a_lst.append([a])
-            r_lst.append([r])
-            s_prime_lst.append(s_prime)
-            prob_a_lst.append([prob_a])
-            done_mask = 0 if done else 1
-            done_lst.append([done_mask])
+        for j in range(buffer_size):
+            for i in range(minibatch_size):
+                rollout = self.data.pop()
+                s_lst, a_lst, r_lst, s_prime_lst, prob_a_lst, done_lst = [], [], [], [], [], []
 
-        s,a,r,s_prime,done_mask, prob_a = torch.tensor(s_lst, dtype=torch.float), torch.tensor(a_lst), \
-                                          torch.tensor(r_lst), torch.tensor(s_prime_lst, dtype=torch.float), \
-                                          torch.tensor(done_lst, dtype=torch.float), torch.tensor(prob_a_lst)
-        self.data = []
-        return s, a, r, s_prime, done_mask, prob_a
+                for transition in rollout:
+                    s, a, r, s_prime, prob_a, done = transition
 
-    def train_net(self):
-        s, a, r, s_prime, done_mask, prob_a = self.make_batch()     # on-policy
+                    s_lst.append(s)
+                    a_lst.append([a])
+                    r_lst.append([r])
+                    s_prime_lst.append(s_prime)
+                    prob_a_lst.append([prob_a])
+                    done_mask = 0 if done else 1
+                    done_lst.append([done_mask])
+                    # pdb.set_trace()
 
-        for i in range(K_epoch):
-            td_target = r + gamma * self.v(s_prime) * done_mask
-            delta = td_target - self.v(s)
-            delta = delta.detach().numpy()
-            # print("delta:", delta)
-            # compute advantage:GAE https://zhuanlan.zhihu.com/p/139097326
+                s_batch.append(s_lst)
+                a_batch.append(a_lst)
+                r_batch.append(r_lst)
+                s_prime_batch.append(s_prime_lst)
+                prob_a_batch.append(prob_a_lst)
+                done_batch.append(done_lst)
+            # pdb.set_trace()
+            # print(torch.tensor(s_batch, dtype=torch.float))
+            # print(torch.tensor(a_batch, dtype=torch.float))
+            # print(torch.tensor(r_batch, dtype=torch.float))
+            # print(torch.tensor(s_prime_batch, dtype=torch.float))
+            # print(torch.tensor(done_batch, dtype=torch.float))
+            # print(torch.tensor(prob_a_batch, dtype=torch.float))
+            mini_batch = torch.tensor(s_batch, dtype=torch.float), torch.tensor(a_batch, dtype=torch.float), \
+                         torch.tensor(r_batch, dtype=torch.float), torch.tensor(s_prime_batch, dtype=torch.float), \
+                         torch.tensor(done_batch, dtype=torch.float), torch.tensor(prob_a_batch, dtype=torch.float)
+            # pdb.set_trace()
+            data.append(mini_batch)
+
+        return data
+
+    def calc_advantage(self, data):
+        data_with_adv = []
+        for mini_batch in data:     # len(data) = buffer_size
+            s, a, r, s_prime, done_mask, old_log_prob = mini_batch
+            with torch.no_grad():
+                # td_target = r + gamma * self.v(s_prime) * done_mask
+                # delta = td_target - self.v(s)
+                # td_target = r + gamma * self.value(s_prime) * done_mask
+                # delta = td_target - self.value(s)
+                td_target = r + gamma * self.v_model(s_prime) * done_mask
+                delta = td_target - self.v_model(s)
+            delta = delta.numpy()
+
             advantage_lst = []
             advantage = 0.0
             for delta_t in delta[::-1]:
-                advantage = gamma * lmbda * advantage + delta_t[0]  # GAE(γ,λ)
+                advantage = gamma * lmbda * advantage + delta_t[0]
                 advantage_lst.append([advantage])
             advantage_lst.reverse()
             advantage = torch.tensor(advantage_lst, dtype=torch.float)
-            # print("advantage:", advantage)
+            data_with_adv.append((s, a, r, s_prime, done_mask, old_log_prob, td_target, advantage))
 
-            pi = self.pi(s, softmax_dim=1)
-            pi_a = pi.gather(1, a)
-            ratio = torch.exp(torch.log(pi_a) - torch.log(prob_a))  # a/b == exp(log(a)-log(b))
+        return data_with_adv
 
-            surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1-eps_clip, 1+eps_clip) * advantage
-            loss = -torch.min(surr1, surr2) + F.smooth_l1_loss(self.v(s), td_target.detach())
+    def train_net(self):
+        if len(self.data) == minibatch_size * buffer_size:
+            data = self.make_batch()
+            data = self.calc_advantage(data)
 
-            self.optimizer.zero_grad()
-            loss.mean().backward()
-            self.optimizer.step()
+            for i in range(K_epoch):
+                for mini_batch in data:
+                    s, a, r, s_prime, done_mask, old_log_prob, td_target, advantage = mini_batch
+
+                    # mu, std = self.pi(s, softmax_dim=1)
+                    # mu, std = self.policy(s)
+                    mu, std = self.pi_model(s)
+                    dist = Normal(mu, std)
+                    log_prob = dist.log_prob(a)
+                    ratio = torch.exp(log_prob - old_log_prob)  # a/b == exp(log(a)-log(b))
+
+                    surr1 = ratio * advantage
+                    surr2 = torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * advantage
+
+                    # loss = -torch.min(surr1, surr2) + F.smooth_l1_loss(self.v(s), td_target)
+                    # loss = -torch.min(surr1, surr2) + F.smooth_l1_loss(self.model.v(s), td_target)
+                    #
+                    # self.optimizer.zero_grad()
+                    # loss.mean().backward()
+                    # nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                    # self.optimizer.step()
+
+                    loss1 = -torch.min(surr1, surr2)
+                    self.pi_optimizer.zero_grad()
+                    loss1.mean().backward(retain_graph=True)
+                    nn.utils.clip_grad_norm_(self.pi_model.parameters(), 1.0)
+                    self.pi_optimizer.step()
+                    #
+                    loss2 = F.smooth_l1_loss(self.v_model(s), td_target)
+                    # loss2 = torch.mean(
+                    #     0.5 * torch.square(self.value(s) - td_target))
+                    self.v_optimizer.zero_grad()
+                    loss2.mean().backward()
+                    nn.utils.clip_grad_norm_(self.v_model.parameters(), 1.0)
+                    self.v_optimizer.step()
+
+
+                    self.optimization_step += 1
 
 
 def main():
-    env = gym.make('CartPole-v1')
-    model = PPO()
+    env = gym.make('Pendulum-v0')
+    # env = gym.make('Safexp-PointGoal1-v0')
+
+    device = torch.device('cpu')
+    model1 = PPO()
     score = 0.0
     print_interval = 20
+    rollout = []
 
     for n_epi in range(10000):
         s = env.reset()
         done = False
         while not done:
-            for t in range(T_horizon):
-                prob = model.pi(torch.from_numpy(s).float())
-                m = Categorical(prob)
-                a = m.sample().item()
-                s_prime, r, done, info = env.step(a)
+            for t in range(rollout_len):
+                # mu, std = model1.pi(torch.from_numpy(s).float())
+                mu, std = model1.pi_model(torch.from_numpy(s).float())
+                # mu, std = model1.policy(torch.from_numpy(s).float())
+                dist = Normal(mu, std)
+                a = dist.sample()
+                #pdb.set_trace()
+                log_prob = dist.log_prob(a)
+                s_prime, r, done, info = env.step([a.item()])
+                # s_prime, r, done, info = env.step([a.tolist()])
+                #pdb.set_trace()
 
-                model.put_data((s, a, r/100.0, s_prime, prob[a].item(), done))
+                rollout.append((s, a, r / 10.0, s_prime, log_prob.item(), done))
+                # rollout.append((s, a, r / 10.0, s_prime, log_prob.tolist(), done))
+                if len(rollout) == rollout_len:
+                    model1.put_data(rollout)
+                    rollout = []
+
                 s = s_prime
-
                 score += r
                 if done:
                     break
 
-            model.train_net()
+            model1.train_net()
 
         if n_epi % print_interval == 0 and n_epi != 0:
-            print("# of episode :{}, avg score : {:.1f}".format(n_epi, score/print_interval))
+            print("# of episode :{}, avg score : {:.1f}, opt step: {}".format(n_epi, score / print_interval,
+                                                                              model1.optimization_step))
             score = 0.0
 
     env.close()
 
 
 if __name__ == '__main__':
+    # env1 = gym.make('Safexp-PointGoal1-v0')
+    # s = env1.observation_space.shape[0]
+    # a = env1.action_space.shape[0]
+    # print(s, a)
     main()
